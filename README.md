@@ -336,3 +336,8 @@ Once a couple of runs look right:
 
 Both run against a throwaway local folder that stands in for the server.
 Nothing touches your Nextcloud.
+
+
+## License
+
+MIT, see [LICENSE](LICENSE).
