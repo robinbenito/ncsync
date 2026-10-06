@@ -1,0 +1,1739 @@
+#!/usr/bin/env python3
+"""
+ncweb - a small local web UI for ncsync: see both sides' changes, pick
+what syncs, choose the folders.
+
+    python3 _sync/ncweb [--no-browser]
+
+Serves on 127.0.0.1 only, with a one-time token in the URL. Nothing is
+exposed to the network. Requires nothing but Python 3.8+ and rclone.
+"""
+import ast
+import calendar
+import collections
+import concurrent.futures
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.parse
+import webbrowser
+
+SELF = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(SELF)
+FILES = os.path.join(REPO, "files")
+CONF = os.path.join(SELF, "rclone.conf")
+FILTERS = os.path.join(SELF, "filters.txt")
+FOLDERS = os.path.join(SELF, "folders.txt")
+STATE = os.path.join(SELF, "state")
+MARKERS = os.path.join(STATE, "initialised")
+NCSYNC = os.path.join(SELF, "ncsync")
+LOGS = os.path.join(SELF, "logs")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+REPO_ID = os.path.join(REPO, ".repo-id")
+
+TOKEN = secrets.token_urlsafe(18)
+
+# ----------------------------------------------------------------- helpers
+
+
+def have_rclone():
+    return shutil.which("rclone") is not None
+
+
+def slug(p):
+    return p.replace("/", "_").replace(" ", "_")
+
+
+def read_selection():
+    if not os.path.exists(FOLDERS):
+        return []
+    out = []
+    with open(FOLDERS, encoding="utf-8") as fh:
+        for line in fh:
+            line = re.sub(r"#.*$", "", line).strip()
+            if line:
+                out.append(line)
+    return out
+
+
+def write_selection(paths):
+    header = []
+    if os.path.exists(FOLDERS):
+        with open(FOLDERS, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() == "" or line.lstrip().startswith("#"):
+                    header.append(line.rstrip("\n"))
+                else:
+                    break
+    while header and header[-1].strip() == "":
+        header.pop()
+    body = "\n".join(header) + "\n\n" + "\n".join(paths) + "\n"
+    tmp = FOLDERS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.replace(tmp, FOLDERS)
+
+
+def overlaps(paths):
+    """Return a (parent, child) pair if one selection contains another."""
+    for a in paths:
+        for b in paths:
+            if a != b and b.startswith(a.rstrip("/") + "/"):
+                return (a, b)
+    return None
+
+
+def last_run(path):
+    m = os.path.join(MARKERS, slug(path))
+    if os.path.exists(m):
+        try:
+            with open(m, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return "?"
+    return None
+
+
+def rclone(args, timeout=180):
+    cmd = ["rclone", "--config", CONF] + args
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+# --------------------------------------------------------------- conflicts
+
+# rclone renames a losing copy with --conflict-suffix, e.g.
+#   shot.exr  ->  shot.exr.conflict-2026-09-181
+# and with --conflict-loser pathname the last digit says where it came from:
+# 1 the server (bisync's Path1), 2 this drive (Path2). Match loosely so older
+# spellings (..path1, .conflict1) show up too, just without an origin.
+# ponytail: name matching, not a conflict database - rclone owns the truth.
+CONFLICT_RE = re.compile(r"\.\.?conflict[^./]*", re.I)
+ORIGIN_RE = re.compile(r"conflict-\d{4}-\d\d-\d\d([12])$")
+ORIGIN = {"1": "server", "2": "drive"}
+
+
+def under_files(rel):
+    """Resolve a client-supplied relative path, refusing anything outside FILES."""
+    full = os.path.realpath(os.path.join(FILES, rel))
+    root = os.path.realpath(FILES)
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def version(rel, origin):
+    try:
+        st = os.stat(os.path.join(FILES, rel))
+    except OSError:
+        return None
+    return {"path": rel, "size": st.st_size, "mtime": st.st_mtime * 1000,
+            "origin": origin}
+
+
+def find_conflicts(limit=500):
+    """Conflict copies grouped under the file they belong to, the file itself
+    first when it still exists: [{base, versions: [{path, size, mtime, origin}]}]."""
+    groups = {}
+    for root, dirs, names in os.walk(FILES):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            m = CONFLICT_RE.search(name)
+            if name.startswith(".") or not m:
+                continue
+            rel = os.path.relpath(os.path.join(root, name), FILES)
+            base = os.path.join(os.path.dirname(rel), CONFLICT_RE.sub("", name))
+            o = ORIGIN_RE.search(m.group(0))
+            v = version(rel, ORIGIN[o.group(1)] if o else "copy")
+            if v:
+                groups.setdefault(base, []).append(v)
+    out = []
+    for base in sorted(groups)[:limit]:
+        cur = version(base, "current")
+        out.append({"base": base, "versions": ([cur] if cur else []) +
+                    sorted(groups[base], key=lambda v: v["path"])})
+    return out, len(groups) > limit
+
+
+def keep_version(rel):
+    """Keep one version of a conflicted file under the original name and delete
+    the other copies beside it. Returns an error message, or None."""
+    keep = under_files(rel)
+    if not keep or not os.path.isfile(keep):
+        return "no such file"
+    d, name = os.path.split(keep)
+    orig = CONFLICT_RE.sub("", name)
+    others = [os.path.join(d, n) for n in os.listdir(d) if n != name
+              and CONFLICT_RE.search(n) and CONFLICT_RE.sub("", n) == orig]
+    if orig == name and not others:
+        return "no conflict copies of that file"
+    if orig != name:
+        os.replace(keep, os.path.join(d, orig))
+    for o in others:
+        os.remove(o)
+    return None
+
+
+# ------------------------------------------------------------------ review
+#
+# The page shows what rclone bisync would find on its next run: each side as
+# it is now, against that same side at the last sync (state/*.path1.lst is
+# the server, *.path2.lst this drive). Unlike bisync it then applies only the
+# ticked changes, and writes the listings back so that every path both sides
+# now agree on counts as synced while every other path keeps its old entry:
+# an unticked change stays a change, like an unstaged file in git. ncsync in
+# the terminal reads the same listings and carries on from there.
+
+E = collections.namedtuple("E", "name dir size ns line")  # line: as read from a listing
+WINDOW = 2 * 10**9  # ncsync's --modify-window 2s
+
+# Everything must match ncsync, the name encoding exactly: otherwise a file
+# called "12:30.pdf" looks deleted on one side and new on the other.
+with open(NCSYNC, encoding="utf-8") as _fh:
+    ENC = re.search(r'--local-encoding "([^"]+)"', _fh.read()).group(1)
+
+
+def flags():
+    """ncsync's rclone flags, minus the bisync-only ones."""
+    return ["--config", CONF, "--local-encoding", ENC, "--modify-window", "2s",
+            "--transfers", os.environ.get("NCSYNC_TRANSFERS", "8"),
+            "--checkers", os.environ.get("NCSYNC_CHECKERS", "16"),
+            "--retries", "3", "--low-level-retries", "10", "--contimeout", "30s",
+            "--timeout", "120s", "--webdav-nextcloud-chunk-size", "32Mi",
+            "--disable-http2"]
+
+
+TIME_RE = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)$")
+
+
+def to_ns(s):
+    """rclone's RFC 3339 or a bisync listing's time -> UTC nanoseconds."""
+    y, mo, d, h, mi, sec, frac, off = TIME_RE.match(s).groups()
+    t = calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(sec)))
+    if off != "Z":
+        off = off.replace(":", "")
+        t -= int(off[0] + "1") * (int(off[1:3]) * 3600 + int(off[3:]) * 60)
+    return t * 10**9 + int((frac or "").ljust(9, "0")[:9])
+
+
+def from_ns(ns):
+    s, f = divmod(ns, 10**9)
+    return "%04d-%02d-%02dT%02d:%02d:%02d.%09d+0000" % (time.gmtime(s)[:6] + (f,))
+
+
+ZERO = to_ns("0001-01-01T00:00:00Z")  # a listing entry with no date on record
+
+# cmd/bisync/listing.go: lineRegex
+LST_RE = re.compile(r'^([-d]) +(-?\d+) (\S+) (\S+) '
+                    r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}[+-]\d{4}) (".+")$')
+
+
+def nfc(name):
+    # macOS can hand back a decomposed "ü" where the server has a composed
+    # one; bisync matches the two up, so must we
+    return unicodedata.normalize("NFC", name)
+
+
+def load_listing(path):
+    """One side of bisync's last-sync listing as {name: E}; None if there is none."""
+    try:
+        fh = open(path, encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    out = {}
+    with fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            m = LST_RE.match(line)
+            if not m or m.group(4) != "-":
+                continue  # bisync ignores these lines too
+            flag, size, _, _, ts, q = m.groups()
+            try:
+                name = json.loads(q)
+            except ValueError:
+                name = ast.literal_eval(q)  # Go quoting JSON lacks: \a \v \x01
+            out[nfc(name)] = E(name, flag == "d", int(size), to_ns(ts), line)
+    return out
+
+
+def save_listing(path, entries):
+    """Write one side back the way bisync does (listing.go: save)."""
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
+        fh.write("# bisync listing v1 from %s\n" % from_ns(time.time_ns()))
+        for e in sorted(entries.values(), key=lambda e: e.name):
+            fh.write((e.line or "%s %8d - - %s %s" % (
+                "d" if e.dir else "-", e.size, from_ns(e.ns),
+                json.dumps(e.name, ensure_ascii=False))) + "\n")
+    os.replace(path + ".tmp", path)
+
+
+def session(folder):
+    """(cwd, local root, state-file prefix), exactly as ncsync hands them to bisync."""
+    name = lambda p2: ("nc:%s..local:%s" % (folder, p2)).replace(":", "_").replace("/", "_")  # noqa: E731
+    runin, p2 = FILES, folder
+    if len(name(p2)) > 235:
+        local = os.path.join(FILES, folder)
+        runin, p2 = os.path.dirname(local), os.path.basename(local)
+    if len(name(p2)) > 235:
+        return None
+    return runin, p2, os.path.join(STATE, name(p2))
+
+
+def lsjson(root, cwd):
+    """One side as it is now, filtered like bisync, as {name: E}."""
+    p = subprocess.run(
+        ["rclone", "lsjson", "-R", "--no-mimetype", "--filter-from", FILTERS, root]
+        + flags(), cwd=cwd, capture_output=True, encoding="utf-8", errors="replace")
+    if p.returncode:
+        raise RuntimeError("could not list %s: %s" % (root, p.stderr.strip()[-300:]))
+    return {nfc(i["Path"]): E(i["Path"], i["IsDir"], -1 if i["IsDir"] else i["Size"],
+                              to_ns(i["ModTime"]), None) for i in json.loads(p.stdout)}
+
+
+def current(folder, runin, p2, prefix):
+    """(server, drive) as they are now - after ncsync's check on the drive's dates."""
+    try:
+        with open(prefix + ".drive-date") as fh:
+            moved = int(os.stat(REPO_ID).st_mtime) - int(fh.read())
+    except (OSError, ValueError):
+        moved = 0
+    if moved:
+        raise RuntimeError(
+            "this drive's file dates moved by %+ds since the last sync (daylight "
+            "saving? another OS?), so every file would look changed. Shift them "
+            "by %+ds before syncing - see 'Dates moved' in the README." % (moved, -moved))
+    os.makedirs(os.path.join(FILES, folder), exist_ok=True)
+    with concurrent.futures.ThreadPoolExecutor(2) as ex:
+        srv = ex.submit(lsjson, "nc:" + folder, runin)
+        loc = ex.submit(lsjson, p2, runin)
+        return srv.result(), loc.result()
+
+
+def differs(a, b):
+    """bisync's size-and-date test (compare.go: sizeDiffers, timeDiffers)."""
+    if a.dir or b.dir:
+        return a.dir != b.dir
+    if a.size >= 0 and b.size >= 0 and a.size != b.size:
+        return True
+    return ZERO not in (a.ns, b.ns) and abs(a.ns - b.ns) >= WINDOW
+
+
+def change(old, now):
+    if old is None:
+        return "new" if now else None
+    if now is None:
+        return "deleted"
+    return "modified" if differs(old, now) else None
+
+
+def info(e):
+    return e and {"size": e.size, "mtime": e.ns // 10**6, "dir": e.dir}
+
+
+def diff(b1, b2, srv, loc):
+    """Each path that changed on either side since the last sync and where the
+    two sides now disagree. Both sides changed = a conflict: bisync would copy
+    a modified file over a deleted one, but here you decide."""
+    out = []
+    for k in sorted(set(b1) | set(b2) | set(srv) | set(loc)):
+        s, l = srv.get(k), loc.get(k)
+        cs, cl = change(b1.get(k), s), change(b2.get(k), l)
+        if not (cs or cl) or (s and l and not differs(s, l)) or not (s or l):
+            continue
+        e = l or s
+        out.append({"key": k, "path": e.name, "dir": e.dir, "server": cs,
+                    "local": cl, "s": info(s), "l": info(l),
+                    "b": info(b1.get(k) or b2.get(k))})
+    return pair_moves(out)
+
+
+def pair_moves(changes):
+    """A file gone from one path and one new at another, on the same side, same
+    size to the byte and same date: a move, done on the other side as a rename
+    instead of a delete and a fresh upload. Only unique matches pair, and only
+    where the other side still has the old file unchanged and nothing at the
+    new path, so the rename leaves both sides equal. No hashes to compare:
+    the listings hold none (ncsync compares size and date), and Nextcloud has
+    checksums for some files only. A re-render gets a new date."""
+    for side, mine, theirs, other in (("local", "l", "s", "server"),
+                                      ("server", "s", "l", "local")):
+        gone = [c for c in changes if c[side] == "deleted" and not c[other]
+                and not c["dir"] and c[theirs] and c[theirs]["size"] > 0]
+        new = [c for c in changes if c[side] == "new" and not c[other]
+               and not c["dir"] and c[mine]["size"] > 0]
+        # same second, no window: a move keeps the date, and the server stores seconds
+        same = lambda a, b: a["size"] == b["size"] and a["mtime"] // 1000 == b["mtime"] // 1000  # noqa: E731
+        hits = {}
+        for n in new:
+            g = [g for g in gone if same(g[theirs], n[mine])]
+            if len(g) == 1:
+                hits.setdefault(g[0]["key"], []).append((n, g[0]))
+        for pairs in hits.values():
+            if len(pairs) == 1:
+                n, g = pairs[0]
+                n[side], n["from"], n["fromPath"] = "moved", g["key"], g["path"]
+                changes.remove(g)
+    return changes
+
+
+def reconcile(b1, b2, srv, loc):
+    """The next baseline: whatever both sides now agree on is synced; every
+    other path keeps its last-sync entry, so it still shows up as a change."""
+    n1, n2 = {}, {}
+    for k in set(b1) | set(b2) | set(srv) | set(loc):
+        s, l = srv.get(k), loc.get(k)
+        if s and l and not differs(s, l):
+            n1[k], n2[k] = s, l
+        elif s or l:
+            if k in b1:
+                n1[k] = b1[k]
+            if k in b2:
+                n2[k] = b2[k]
+    return n1, n2
+
+
+def parents(key):
+    while "/" in key:
+        key = key.rsplit("/", 1)[0]
+        yield key
+
+
+def outermost(pairs):
+    """Deleted folders not inside another deleted folder (rmdirs is recursive)."""
+    keys = {k for k, _ in pairs}
+    return [n for k, n in pairs if not any(p in keys for p in parents(k))]
+
+
+def innermost(dirs, files):
+    """New folders nothing else creates: no new subfolder, no file copied in."""
+    covered = {p for k, _ in dirs + files for p in parents(k)}
+    return [n for k, n in dirs if k not in covered]
+
+
+REVIEW = {"folders": {}, "copies": [], "more": False, "at": None}
+
+
+def review(folder):
+    s = session(folder)
+    if not s:
+        return {"folder": folder, "error": "too deep for rclone's state files - "
+                "sync a shallower parent folder instead"}
+    try:
+        srv, loc = current(folder, *s)
+    except Exception as exc:  # noqa: BLE001
+        return {"folder": folder, "error": str(exc)}
+    b1 = load_listing(s[2] + ".path1.lst") or {}
+    b2 = load_listing(s[2] + ".path2.lst") or {}
+    return {"folder": folder, "synced": last_run(folder),
+            "changes": diff(b1, b2, srv, loc)}
+
+
+def scan_task(job):
+    for folder in read_selection():
+        job.record("checking " + folder)
+        REVIEW["folders"][folder] = r = review(folder)
+        job.record("  " + (("! " + r["error"]) if "error" in r
+                           else "%d changes" % len(r["changes"])))
+    REVIEW["copies"], REVIEW["more"] = find_conflicts()
+    REVIEW["at"] = time.time() * 1000
+    return 0
+
+
+def apply_task(job, picks):
+    """picks: {folder: {name: "up" | "down"}}. Make each picked path on the
+    other side match this drive (up) or the server (down), then record in
+    bisync's listings whatever both sides now agree on."""
+    failed = False
+    for folder, want in picks.items():
+        job.record("==> " + folder)
+        s = session(folder)
+        if not s or os.path.exists(s[2] + ".lck"):
+            job.record("! skipped - " + ("too deep for rclone's state files" if not s else
+                       "rclone bisync is running on it, or crashed: " + s[2] + ".lck"))
+            failed = True
+            continue
+        runin, p2, prefix = s
+        b1 = load_listing(prefix + ".path1.lst") or {}
+        b2 = load_listing(prefix + ".path2.lst") or {}
+        try:
+            srv, loc = current(folder, *s)
+        except Exception as exc:  # noqa: BLE001
+            job.record("! " + str(exc))
+            failed = True
+            continue
+
+        # Only what still looks the way it did on the page: a file saved again
+        # since the check is left for the next look, not overwritten blind.
+        seen = {c["key"]: c for c in REVIEW["folders"].get(folder, {}).get("changes", [])}
+        now = {c["key"]: c for c in diff(b1, b2, srv, loc)}
+        todo = collections.defaultdict(list)  # (way, op) -> [(key, name)]
+        for k, way in want.items():
+            c, was = now.get(k), seen.get(k)
+            if not c or not was or (c["s"], c["l"], c.get("from")) != \
+                    (was["s"], was["l"], was.get("from")):
+                job.record("skipped, changed since the check: " + k)
+                continue
+            src, dst = (loc, srv) if way == "up" else (srv, loc)
+            if c.get("from"):
+                if c["local" if way == "up" else "server"] == "moved":
+                    todo[way, "move"].append((k, (dst[c["from"]].name, src[k].name)))
+            elif k in src:
+                todo[way, "mkdir" if src[k].dir else "copy"].append((k, src[k].name))
+            else:
+                todo[way, "rmdirs" if dst[k].dir else "delete"].append((k, dst[k].name))
+
+        ok = True
+        ends = {"up": (p2, "nc:" + folder), "down": ("nc:" + folder, p2)}
+        # ponytail: one rclone per moved file; a renamed folder of 2,000
+        # frames takes minutes, not the hours of sending it again. Moving the
+        # folder in one go is the upgrade if that ever drags.
+        for way, (a, b) in ends.items():
+            job.phase = way
+            for _, (old, new) in todo[way, "move"]:
+                if job.rclone(["moveto", b + "/" + old, b + "/" + new], runin):
+                    job.record(new + ": Moved")
+                else:
+                    ok = False
+        for way, (a, b) in ends.items():
+            job.phase = way
+            if todo[way, "copy"]:
+                ok &= job.rclone(["copy", a, b, "--no-traverse"], runin,
+                                 [n for _, n in todo[way, "copy"]])
+        for way, (a, b) in ends.items():
+            job.phase = way
+            if todo[way, "delete"]:
+                ok &= job.rclone(["delete", b], runin, [n for _, n in todo[way, "delete"]])
+        for way, (a, b) in ends.items():
+            job.phase = way
+            for n in outermost(todo[way, "rmdirs"]):
+                ok &= job.rclone(["rmdirs", b + "/" + n], runin)
+            for n in innermost(todo[way, "mkdir"], todo[way, "copy"]):
+                ok &= job.rclone(["mkdir", b + "/" + n], runin)
+        job.phase = None
+
+        # Record the outcome even after a failure or Stop: whatever did
+        # arrive on both sides is synced, the rest stays a change.
+        try:
+            srv, loc = current(folder, *s)
+        except Exception as exc:  # noqa: BLE001
+            job.record("! could not check the result: %s" % exc)
+            failed = True
+            continue
+        n1, n2 = reconcile(b1, b2, srv, loc)
+        if n1:  # bisync refuses an empty listing
+            save_listing(prefix + ".path1.lst", n1)
+            save_listing(prefix + ".path2.lst", n2)
+            # bisync records the filters' hash only on --resync, and refuses
+            # to run without it - after a first sync made here, for one
+            if not os.path.exists(FILTERS + ".md5"):
+                with open(FILTERS, "rb") as fh, open(FILTERS + ".md5", "w") as out:
+                    out.write(hashlib.md5(fh.read()).hexdigest())
+            with open(prefix + ".drive-date", "w") as fh:
+                fh.write("%d\n" % os.stat(REPO_ID).st_mtime)
+            os.makedirs(MARKERS, exist_ok=True)
+            with open(os.path.join(MARKERS, slug(folder)), "w", encoding="utf-8") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M") + "\n")
+        left = diff(n1, n2, srv, loc)
+        REVIEW["folders"][folder] = {"folder": folder, "synced": last_run(folder),
+                                     "changes": left}
+        job.record("    %s - %d changes left" % ("done" if ok else "FAILED", len(left)))
+        failed |= not ok
+    REVIEW["copies"], REVIEW["more"] = find_conflicts()
+    REVIEW["at"] = time.time() * 1000
+    return 1 if failed else 0
+
+
+def resync_task(job):
+    return job.run(["bash", NCSYNC, "--resync"], SELF,
+                   dict(os.environ, TERM="dumb", NCSYNC_JSON="1"))
+
+
+# --------------------------------------------------------------------- jobs
+
+class Job:
+    """One thing at a time: checking for changes, syncing, or a fresh sync."""
+
+    def __init__(self):
+        self.lines = []
+        self.running = False
+        self.kind = None
+        self.phase = None  # "up" / "down" while a sync moves files that way
+        self.proc = None
+        self.stopping = False
+        self.lock = threading.Lock()
+        self.rc = None
+        self.stats = None
+        self.log = None
+
+    def start(self, kind, task, log=True):
+        """Run task(self) in a thread; what it returns is the exit code."""
+        with self.lock:
+            if self.running:
+                return False
+            self.lines, self.running, self.kind, self.phase = [], True, kind, None
+            self.rc, self.stats, self.stopping = None, None, False
+            if log:
+                os.makedirs(LOGS, exist_ok=True)
+                self.log = open(os.path.join(
+                    LOGS, time.strftime("%Y-%m-%d_%H-%M-%S") + "-web.log"),
+                    "a", encoding="utf-8")
+
+        def run():
+            try:
+                self.rc = task(self) or 0
+            except Exception as exc:  # noqa: BLE001
+                self.record("! ncweb error: %s" % exc)
+                self.rc = 1
+            finally:
+                with self.lock:
+                    self.running = False
+                    self.stats = None
+                    if self.log:
+                        self.log.close()
+                        self.log = None
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def run(self, argv, cwd, env=None):
+        """A child process with its output streamed to the page; its exit code."""
+        if self.stopping:
+            return 1
+        self.proc = subprocess.Popen(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", bufsize=1, env=env)
+        for raw in self.proc.stdout:
+            self.absorb(raw.rstrip("\n"))
+        return self.proc.wait()
+
+    def rclone(self, args, cwd, names=None):
+        """rclone with ncsync's flags and live progress; names go to --files-from-raw
+        (raw: a file called '#1.exr' is a file, not a comment). True if it worked."""
+        extra = ["--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE",
+                 "--log-level", "INFO"]
+        if names is None:
+            return self.run(["rclone"] + args + flags() + extra, cwd) == 0
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".lst",
+                                         delete=False) as fh:
+            fh.write("".join(n + "\n" for n in names))
+        try:
+            return self.run(["rclone"] + args + flags() + extra +
+                            ["--files-from-raw", fh.name], cwd) == 0
+        finally:
+            os.remove(fh.name)
+
+    def record(self, line):
+        """Append to self.lines; the log file gets the same text. Caller holds no lock."""
+        line = ANSI_RE.sub("", line)
+        with self.lock:
+            self.lines.append(line)
+            if self.log:
+                try:
+                    self.log.write(line + "\n")
+                    self.log.flush()
+                except OSError:
+                    self.log = None
+
+    def absorb(self, line):
+        """rclone emits JSON with --use-json-log; ncsync's own echoes are plain."""
+        if line[:1] == "{":
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict):
+                st = obj.get("stats")
+                if isinstance(st, dict):
+                    with self.lock:
+                        self.stats = st
+                    return
+                msg = obj.get("msg")
+                if msg is not None:
+                    if obj.get("object"):  # "Copied (new)" - which file is on the side
+                        msg = "%s: %s" % (obj["object"], msg)
+                    lvl = obj.get("level", "")
+                    for m in str(msg).splitlines():
+                        m = m.rstrip()
+                        if m:
+                            self.record(
+                                ("! " + m) if lvl in ("error", "critical") else m)
+                    return
+        self.record(line)
+
+    def tail(self, offset):
+        with self.lock:
+            return (self.lines[offset:], len(self.lines), self.running,
+                    self.rc, self.stats, self.kind, self.phase)
+
+    def stop(self):
+        self.stopping = True
+        if self.proc and self.running:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+
+
+JOB = Job()
+
+# -------------------------------------------------------------------- HTML
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nextcloud sync</title>
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#fff; --ink:#1c1c1a; --dim:#6b6b66; --line:#e2e2dd;
+  --accent:#2f6f4f; --accent-ink:#fff; --warn:#8a5a00; --warn-bg:#fdf6e3;
+  --err:#a02020; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#161714; --panel:#1e201c; --ink:#e8e8e3; --dim:#9a9a92; --line:#2e312c;
+  --accent:#6fbf8f; --accent-ink:#11150f; --warn:#e0b060; --warn-bg:#2a2415;
+  --err:#e08080;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{padding:14px 18px;border-bottom:1px solid var(--line);
+  display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+h1{font-size:15px;margin:0;font-weight:600}
+.sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+.app{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:calc(100vh - 50px)}
+.app.shut{grid-template-columns:0 minmax(0,1fr)}
+.side{border-right:1px solid var(--line);background:var(--panel);min-width:0;
+  display:flex;flex-direction:column;position:sticky;top:0;max-height:100vh;overflow:hidden}
+.shut .side{visibility:hidden;border:0}
+.side h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+  margin:0;padding:12px 14px 6px}
+.side .tree{flex:1 1 auto;max-height:none;overflow-x:hidden}
+.side .tree .row{flex-wrap:wrap;row-gap:0}
+.side .tree .nm{flex:1 1 0}
+.side .tree .lr{order:5;flex-basis:calc(100% - 48px);margin:-3px 0 0 48px}
+.side .bar{border-top:1px solid var(--line)}
+.side .fresh{padding:10px 14px 14px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)}
+.side .fresh button{margin-bottom:6px}
+.wrap{display:flex;flex-direction:column;gap:16px;padding:16px;min-width:0}
+#sidebtn{font-size:13px;padding:3px 9px}
+@media (max-width:860px){.app,.app.shut{grid-template-columns:minmax(0,1fr)}
+  .side{position:static;max-height:60vh;border-right:0;border-bottom:1px solid var(--line)}
+  .shut .side{display:none}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  overflow:hidden;min-width:0}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--dim);margin:0;padding:10px 14px;border-bottom:1px solid var(--line)}
+.tree{max-height:60vh;overflow:auto;padding:6px 0}
+.row{display:flex;align-items:center;gap:8px;padding:3px 14px;
+  white-space:nowrap;min-width:0}
+.row:hover{background:rgba(127,127,127,.08)}
+.tw{width:16px;text-align:center;cursor:pointer;color:var(--dim);
+  user-select:none;flex:none}
+.tw.leaf{cursor:default;opacity:.25}
+button.tw{border:0;background:none;padding:0;font-size:inherit}
+.nm{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.sz{margin-left:auto;color:var(--dim);font-size:12px;font-family:var(--mono);
+  flex:none;padding-left:10px}
+.sz button{font-size:11px;padding:1px 6px}
+.lr{color:var(--accent);font-size:11px;font-family:var(--mono);flex:none}
+.bar{padding:12px 14px;border-top:1px solid var(--line);display:flex;
+  gap:8px;flex-wrap:wrap;align-items:center}
+.card>.bar:first-of-type{border-top:0}
+button{font:inherit;font-size:13px;padding:5px 12px;border-radius:6px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  cursor:pointer}
+button:hover:not(:disabled){border-color:var(--dim)}
+button:disabled{opacity:.45;cursor:default}
+button.p{background:var(--accent);color:var(--accent-ink);border-color:transparent;
+  font-weight:600}
+pre{margin:0;padding:12px 14px;max-height:40vh;overflow:auto;
+  font-family:var(--mono);font-size:12px;line-height:1.45;white-space:pre-wrap;
+  word-break:break-word}
+details>summary{padding:8px 14px;cursor:pointer;color:var(--dim);font-size:12px;
+  border-top:1px solid var(--line)}
+.prog{padding:0}
+.prog.on{padding:10px 14px;border-bottom:1px solid var(--line)}
+.pline{display:flex;justify-content:space-between;gap:10px;font-size:12px;
+  font-family:var(--mono);color:var(--dim);margin-bottom:6px}
+.pbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+.pbar i{display:block;height:100%;background:var(--accent);
+  transition:width .35s ease}
+.pbar.sm{height:4px;margin-top:4px}
+.note{padding:10px 14px;background:var(--warn-bg);color:var(--warn);
+  font-size:13px;border-bottom:1px solid var(--line)}
+.err{color:var(--err)}
+.count{color:var(--dim);font-size:12px}
+.spin{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--accent);animation:p 1s infinite}
+@keyframes p{0%,100%{opacity:.25}50%{opacity:1}}
+
+/* changes: this drive | the server */
+.sum{padding:10px 14px;border-top:1px solid var(--line);display:flex;
+  flex-direction:column;gap:2px;font-size:13px}
+.sum .ok{color:var(--accent);font-weight:600}
+.ab{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  border-top:1px solid var(--line)}
+.ab>section+section{border-left:1px solid var(--line)}
+@media (max-width:860px){.ab{grid-template-columns:minmax(0,1fr)}
+  .ab>section+section{border-left:0;border-top:1px solid var(--line)}}
+.ab h3{margin:0;padding:10px 14px 2px;font-size:13px}
+.ab h3 small{font-weight:400;color:var(--dim)}
+.ab .tot{padding:0 14px 8px;font-size:12px;color:var(--dim);
+  border-bottom:1px solid var(--line);min-height:26px}
+.list{max-height:60vh;overflow:auto;padding:4px 0}
+.list .row{padding-left:calc(14px + var(--d,0) * 18px);align-items:flex-start}
+.list .row>input{margin-top:4px}
+.list .body{flex:1 1 0;min-width:0;display:flex;flex-wrap:wrap;align-items:center;
+  column-gap:8px}
+.list .nm{flex:0 1 auto;white-space:normal;overflow-wrap:anywhere}
+.list .dir .nm{white-space:nowrap}
+.list .dir .nm{direction:rtl;text-align:left;font-weight:500;cursor:pointer}
+.list .dir .nm bdi{direction:ltr}
+.list .meta{margin-left:auto;color:var(--dim);font-size:12px;font-family:var(--mono)}
+.list .off .nm,.list .off .kind{opacity:.5}
+.list .rp{flex:1 0 100%;display:flex;align-items:center;gap:8px;margin:2px 0 3px}
+.list .rp[hidden]{display:none}
+.list .rp .pbar{flex:1;margin:0}
+.list .rpt{flex:none;min-width:5em;text-align:right;font-size:11px;
+  font-family:var(--mono);color:var(--dim)}
+.list .fin .rpt{color:var(--accent)}
+.list .empty{padding:10px 14px;color:var(--dim);font-size:13px}
+.kind{flex:none;font-size:11px;padding:0 6px;border-radius:9px;
+  border:1px solid currentColor}
+.k-new{color:var(--accent)} .k-modified{color:var(--warn)} .k-deleted{color:var(--err)}
+.k-moved{color:var(--dim)}
+.list .from{flex-basis:100%;font-size:11px;font-family:var(--mono);color:var(--dim);
+  white-space:normal;overflow-wrap:anywhere}
+.nm.gone{text-decoration:line-through}
+.act{flex:none;font-size:11px;color:var(--dim)}
+
+/* needs a decision */
+.decide{padding:12px 14px;border-top:1px solid var(--line);background:var(--warn-bg)}
+.decide h3{margin:0;font-size:13px;color:var(--warn)}
+.decide p{margin:4px 0 0;font-size:13px}
+.cf{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;margin-top:10px}
+.cfn{font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.cfp{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:8px;
+  overflow-wrap:anywhere}
+.vs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+  gap:8px;margin-top:8px}
+.ver{display:flex;flex-direction:column;gap:3px;border:1px solid var(--line);
+  border-radius:6px;padding:8px 10px;min-width:0}
+label.ver{cursor:pointer}
+.ver:has(input:checked){border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.ver b{display:flex;align-items:center;gap:6px;font-size:13px}
+.ver .meta{font-size:12px;font-family:var(--mono);color:var(--dim)}
+.ver .fnm{font-size:11px;font-family:var(--mono);color:var(--dim);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ver button{align-self:flex-start;margin-top:4px}
+.tag{font-size:11px;font-weight:600;color:var(--accent)}
+.cf.c3{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;padding:8px 12px;margin-top:6px}
+.c3 .cfh{flex:1 1 240px;min-width:0}
+.c3 .cfn{font-size:14px}
+.c3 .cfp{margin-top:1px}
+.seg{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);flex:0 1 430px;
+  border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg label{position:relative;display:flex;flex-direction:column;justify-content:center;
+  padding:4px 12px;font-size:12px;cursor:pointer;border-left:1px solid var(--line)}
+.seg label:first-child{border-left:0}
+.seg input{position:absolute;opacity:0;pointer-events:none}
+.seg .m{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.seg label:has(input:checked){background:var(--accent);color:var(--accent-ink)}
+.seg label:has(input:checked) .m{color:inherit;opacity:.85}
+.seg label:has(input[value=""]:checked){background:var(--line);color:var(--ink)}
+.seg label:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:-2px}
+</style></head><body>
+<header>
+  <button id="sidebtn" aria-controls="side" aria-expanded="true" title="Show or hide the folder list">&#9776; Folders</button>
+  <h1>Nextcloud sync</h1>
+  <span class="sub" id="remote"></span>
+  <span class="sub" id="repo"></span>
+</header>
+<div id="warn"></div>
+<div class="app" id="app">
+<aside class="side" id="side" aria-label="Folders to sync">
+  <h2>Folders on the server</h2>
+  <div class="tree" id="tree"><div class="row"><span class="count">loading…</span></div></div>
+  <div class="bar">
+    <button id="save" class="p">Save list</button>
+    <span class="count" id="sel"></span>
+    <span class="count" id="pickmsg"></span>
+  </div>
+  <div class="fresh">
+    <button id="resync">Fresh sync</button><br>
+    Throws the record of the last sync away and rebuilds it from both sides. Where
+    a file differs, the newer copy wins, and files deleted on one side come back.
+    Only for when a sync keeps failing.
+  </div>
+</aside>
+<main class="wrap">
+  <section class="card" aria-labelledby="h-changes">
+    <h2 id="h-changes">Changes since the last sync</h2>
+    <div class="bar">
+      <button id="scan">Check for changes</button>
+      <button id="apply" class="p" disabled>Sync</button>
+      <button id="stop" disabled>Stop</button>
+      <span class="count" id="applyinfo"></span>
+      <span class="count" id="jobstate"></span>
+    </div>
+    <div class="sum" id="summary"></div>
+    <div id="decide"></div>
+    <div class="ab">
+      <section><h3>On this drive <small>&rarr; goes to the server</small></h3>
+        <div class="tot" id="totL"></div><div class="prog" id="progL"></div>
+        <div class="list" id="colL"></div></section>
+      <section><h3>On the server <small>&rarr; comes to this drive</small></h3>
+        <div class="tot" id="totS"></div><div class="prog" id="progS"></div>
+        <div class="list" id="colS"></div></section>
+    </div>
+    <details id="logbox"><summary>Log</summary><pre id="log"></pre></details>
+  </section>
+</main>
+</div>
+<script>
+const T = new URLSearchParams(location.search).get("t") || "";
+const api = (p, o) => fetch(p + (p.includes("?") ? "&" : "?") + "t=" + T, o)
+  .then(r => r.json());
+const post = (p, body) => api(p, {
+  method: "POST", headers: {"content-type": "application/json"},
+  body: JSON.stringify(body || {}),
+});
+const el = id => document.getElementById(id);
+
+function sidebar(show) {
+  el("app").classList.toggle("shut", !show);
+  el("sidebtn").setAttribute("aria-expanded", show);
+  try { localStorage.setItem("ncweb.side", show ? "1" : "0"); } catch (e) {}
+}
+el("sidebtn").onclick = () => sidebar(el("app").classList.contains("shut"));
+try { if (localStorage.getItem("ncweb.side") === "0") sidebar(false); } catch (e) {}
+
+let selected = new Set();
+let nodes = new Map();   // path -> {children:[], loaded:bool, open:bool, size:null}
+let lastRuns = {};
+let saved = 0;           // folders in folders.txt
+
+function node(p) {
+  if (!nodes.has(p)) nodes.set(p, {children: [], loaded: false, open: false, size: null});
+  return nodes.get(p);
+}
+
+function fmt(b) {
+  if (b === null || b === undefined) return "";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, n = b;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n < 10 && i > 1 ? 1 : 0) + " " + u[i];
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+function dur(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+  return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+}
+
+function when(ms) {
+  const d = new Date(ms), o = {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"};
+  if (d.getFullYear() !== new Date().getFullYear()) o.year = "numeric";
+  return d.toLocaleString(undefined, o);
+}
+
+const base = p => p.slice(p.lastIndexOf("/") + 1);
+
+// ----------------------------------------------------------------- changes
+// One item per changed path. Its way: "up" makes the server match this
+// drive, "down" the other way round, "" leaves it for later. Nothing is
+// ever decided for a conflict.
+let review = {folders: [], copies: []};
+let items = [];
+const choice = new Map();   // item id -> way, where you changed the default
+const open = new Map();     // tree node id -> expanded
+let busy = false;
+
+function flatten() {
+  items = [];
+  for (const f of review.folders) for (const c of f.changes || []) {
+    const side = c.local && c.server ? "both" : c.local ? "local" : "server";
+    items.push({i: items.length, id: f.folder + "\u0000" + c.key, folder: f.folder, c, side,
+                def: side === "local" ? "up" : side === "server" ? "down" : ""});
+  }
+}
+const way = it => choice.has(it.id) ? choice.get(it.id) : it.def;
+
+function pick(list, on) {
+  for (const it of list) {
+    const w = on ? it.def : "";
+    if (w === it.def) choice.delete(it.id); else choice.set(it.id, w);
+  }
+}
+
+// Each column is a tree of folders; a chain of folders holding nothing but
+// one folder is squashed into a single row.
+function build(list, col) {
+  const roots = new Map(), mk = (name, id) => ({name, id, kids: new Map(), item: null});
+  for (const it of list) {
+    let n = roots.get(it.folder);
+    if (!n) roots.set(it.folder, n = mk(it.folder, col + it.folder));
+    for (const part of it.c.path.split("/")) {
+      if (!n.kids.has(part)) n.kids.set(part, mk(part, n.id + "/" + part));
+      n = n.kids.get(part);
+    }
+    n.item = it;
+  }
+  const squash = n => {
+    for (const k of n.kids.values()) {
+      while (k.kids.size === 1) {
+        const only = k.kids.values().next().value;
+        if (!only.kids.size || (k.item && !only.item)) break;
+        if (k.item) k.item.implied = true;
+        k.name += "/" + only.name; k.id = only.id; k.kids = only.kids; k.item = only.item;
+      }
+      if (k.item && k.kids.size) k.item.implied = true;   // a folder that goes with its contents
+      squash(k);
+    }
+  };
+  for (const r of roots.values()) squash(r);
+  return [...roots.values()];
+}
+
+function under(n) {
+  if (!n.all) {
+    n.all = n.item && !n.item.implied ? [n.item] : [];
+    for (const k of n.kids.values()) for (const it of under(k)) n.all.push(it);
+  }
+  return n.all;
+}
+
+const kindOf = (it, col) => col === "L" ? it.c.local : it.c.server;
+const verOf = (it, col) => col === "L" ? it.c.l : it.c.s;
+
+function badge(it, col) {
+  const k = kindOf(it, col);
+  return '<span class="kind k-' + k + '">' +
+    (it.c.dir ? {new: "new folder", deleted: "folder deleted"}[k] || k : k) + "</span>";
+}
+
+function meta(it, col) {
+  const v = verOf(it, col), b = it.c.b;
+  if (it.c.dir) return "";
+  if (!v) return b ? "was " + fmt(b.size) : "";
+  return fmt(v.size) + (b && !b.dir && b.size !== v.size ? " (was " + fmt(b.size) + ")" : "") +
+    " · " + when(v.mtime);
+}
+
+function totals(list, col) {
+  const n = {modified: 0, new: 0, moved: 0, deleted: 0};
+  let bytes = 0, dirs = 0;
+  for (const it of list) {
+    if (it.c.dir) { dirs++; continue; }
+    n[kindOf(it, col)]++;
+    const v = verOf(it, col);
+    if (v && !it.c.from) bytes += v.size;   // a move sends nothing
+  }
+  const out = [];
+  for (const k in n) if (n[k]) out.push('<span class="k-' + k + '">' + n[k].toLocaleString() + " " + k + "</span>");
+  if (dirs) out.push(dirs + (dirs === 1 ? " folder" : " folders"));
+  if (bytes) out.push(fmt(bytes));
+  return out.join(" · ");
+}
+
+// Say only what the move changed: the folder, the name, or both.
+function movedFrom(c) {
+  const dir = p => p.slice(0, p.lastIndexOf("/") + 1);
+  if (base(c.fromPath) === base(c.path)) return "from " + (dir(c.fromPath) || "the top folder");
+  if (dir(c.fromPath) === dir(c.path)) return "renamed from " + base(c.fromPath);
+  return "from " + c.fromPath;
+}
+
+const RP = '<span class="rp" hidden><span class="pbar sm"><i></i></span><span class="rpt"></span></span>';
+
+function column(col, box, list) {
+  const nodes = [], rows = [];
+  const kids = n => [...n.kids.values()].sort((a, b) =>
+    (b.kids.size > 0) - (a.kids.size > 0) || a.name.localeCompare(b.name));
+  const walk = (n, depth) => {
+    if (!n.kids.size) {
+      const it = n.item, on = !!way(it), gone = !verOf(it, col);
+      rows.push('<div class="row' + (on ? "" : " off") + '" style="--d:' + depth + '">' +
+        '<input type="checkbox" data-i="' + it.i + '"' + (on ? " checked" : "") +
+        (busy ? " disabled" : "") + ' aria-label="sync ' + esc(n.name) + '"><span class="body">' +
+        '<span class="nm' + (gone ? " gone" : "") + '" title="' + esc(it.c.path) + '">' +
+        esc(n.name) + "</span>" + badge(it, col) +
+        '<span class="meta">' + meta(it, col) + "</span>" +
+        (it.c.from ? '<span class="from" title="from ' + esc(it.c.fromPath) + '">' + esc(movedFrom(it.c)) + "</span>" : "") +
+        RP + "</span></div>");
+      return;
+    }
+    const all = under(n), on = all.filter(way).length, i = nodes.push(n) - 1;
+    const isOpen = open.has(n.id) ? open.get(n.id) : depth === 0 || all.length <= 12;
+    rows.push('<div class="row dir' + (on ? "" : " off") + '" style="--d:' + depth + '">' +
+      '<input type="checkbox" data-n="' + i + '"' + (on === all.length ? " checked" : "") +
+      (on && on < all.length ? " data-mixed" : "") + (busy ? " disabled" : "") +
+      ' aria-label="sync everything in ' + esc(n.name) + '">' +
+      '<button class="tw" data-t="' + i + '" aria-expanded="' + isOpen + '">' + (isOpen ? "▾" : "▸") + "</button>" +
+      '<span class="body"><span class="nm" data-t="' + i + '" title="' + esc(n.name) + '"><bdi>' +
+      esc(n.name) + "/</bdi></span>" + (n.item ? badge(n.item, col) : "") +
+      '<span class="meta">' + totals(all, col) + "</span>" + RP + "</span></div>");
+    if (isOpen) for (const k of kids(n)) walk(k, depth + 1);
+  };
+  for (const r of build(list, col)) walk(r, 0);
+  box._nodes = nodes;
+  box.innerHTML = rows.join("") ||
+    '<div class="empty">Nothing changed here since the last sync.</div>';
+  box.querySelectorAll("[data-mixed]").forEach(cb => { cb.indeterminate = true; });
+}
+
+function listen(box) {
+  box.addEventListener("click", e => {
+    const t = e.target.closest("[data-t]");
+    if (!t) return;
+    const n = box._nodes[+t.dataset.t], row = t.closest(".row");
+    open.set(n.id, row.querySelector(".tw").getAttribute("aria-expanded") !== "true");
+    draw();
+  });
+  box.addEventListener("change", e => {
+    const cb = e.target;
+    if (cb.dataset.i) pick([items[+cb.dataset.i]], cb.checked);
+    else if (cb.dataset.n) pick(under(box._nodes[+cb.dataset.n]), cb.checked);
+    draw();
+  });
+}
+
+// One row per conflict: the name, its folder underneath, and a three-way
+// switch - the server's version, leave it, or this drive's.
+function conflictCard(it) {
+  const w = way(it), l = it.c.l, s = it.c.s;
+  const newer = l && s && Math.abs(l.mtime - s.mtime) >= 2000 ? (l.mtime > s.mtime ? "up" : "down") : "";
+  const same = l && s && !l.dir && !s.dir && l.size === s.size;
+  const full = it.folder + "/" + it.c.path, i = full.lastIndexOf("/");
+  const opt = (value, who, v) =>
+    '<label><input type="radio" name="c' + it.i + '" data-i="' + it.i + '" value="' + value + '"' +
+    (w === value ? " checked" : "") + (busy ? " disabled" : "") + "><b>" + who + "</b>" +
+    (value ? '<span class="m">' + (!v ? "deleted" : v.dir ? "folder" : fmt(v.size) + " · " + when(v.mtime)) +
+      (newer === value ? " · newer" : "") + "</span>" : "") + "</label>";
+  return '<div class="cf c3"><div class="cfh"><div class="cfn">' + esc(full.slice(i + 1)) + "</div>" +
+    '<div class="cfp">in ' + esc(full.slice(0, i)) +
+    (same ? " · same size on both sides, maybe the same file" : "") + "</div></div>" +
+    '<div class="seg" role="radiogroup" aria-label="which version of ' + esc(full.slice(i + 1)) + '">' +
+    opt("down", "Server", s) + opt("", "Later") + opt("up", "This drive", l) + "</div></div>";
+}
+
+// A card leads with the file's name; the folder it is in goes underneath.
+function where(full) {
+  const i = full.lastIndexOf("/");
+  return ['<div class="cfn">' + esc(full.slice(i + 1)) + "</div>",
+          '<div class="cfp">in ' + esc(full.slice(0, i)) + "</div>"];
+}
+
+const WHO = {server: "The server's version", drive: "This drive's version",
+             current: "The file as it is now", copy: "A saved copy"};
+
+function copyCard(g) {
+  const [name, dir] = where(g.base), bn = base(g.base);
+  const newest = v => g.versions.every(o => o === v || v.mtime - o.mtime >= 2000);
+  return '<div class="cf">' + name + '<div class="vs">' + g.versions.map(v =>
+      '<div class="ver"><b>' + WHO[v.origin] +
+      (newest(v) ? '<span class="tag">newest</span>' : "") + "</b>" +
+      '<span class="meta">' + fmt(v.size) + " · saved " + when(v.mtime) + "</span>" +
+      (v.origin === "current" ? "" : '<span class="fnm" title="' + esc(v.path) + '">as ' +
+        esc(base(v.path).startsWith(bn) ? "…" + base(v.path).slice(bn.length) : base(v.path)) + "</span>") +
+      '<button data-keep="' + esc(v.path) + '" data-who="' + esc(WHO[v.origin]) + '"' +
+      (busy ? " disabled" : "") + ">Keep this one</button></div>").join("") + "</div>" + dir + "</div>";
+}
+
+function decide() {
+  const cs = items.filter(it => it.side === "both"), cp = review.copies || [];
+  let h = "";
+  if (cs.length) {
+    h += "<h3>" + cs.length + (cs.length === 1 ? " file" : " files") +
+      " changed on both sides</h3><p>Pick the version that wins; it replaces the other when you sync. " +
+      "Left on Later, neither side is touched.</p>" +
+      cs.map(conflictCard).join("");
+  }
+  if (cp.length) {
+    h += (cs.length ? '<h3 style="margin-top:16px">' : "<h3>") +
+      cp.length + (cp.length === 1 ? " file" : " files") + " with conflict copies" +
+      (review.more ? " (first 500 shown)" : "") + "</h3>" +
+      "<p>An earlier sync found these changed on both sides and kept every version, " +
+      "renamed. Keep one: it goes back under the original name, and the other copies are " +
+      "deleted from this drive. The server follows on your next sync.</p>" +
+      cp.map(copyCard).join("");
+  }
+  el("decide").className = h ? "decide" : "";
+  el("decide").innerHTML = h;
+}
+
+function summary() {
+  const h = review.folders.map(f => "<div><b>" + esc(f.folder) + "</b> &nbsp;" +
+    (f.error ? '<span class="err">' + esc(f.error) + "</span>"
+      : f.synced ? '<span class="count">last synced ' + esc(f.synced) + "</span>"
+      : '<span class="count">never synced — below is what the first sync would do</span>') +
+    "</div>");
+  if (review.at) {
+    const clean = !items.length && !(review.copies || []).length && !review.folders.some(f => f.error);
+    h.push('<div class="count">checked ' + when(review.at) +
+      (clean ? ' &nbsp;<span class="ok">Everything is in sync.</span>' : "") + "</div>");
+  }
+  if (!saved) h.push("<div>No folders picked yet. Tick the ones you want under " +
+    "<b>Folders on the server</b>, then <b>Save list</b>.</div>");
+  el("summary").innerHTML = h.join("");
+}
+
+function draw() {
+  column("L", el("colL"), items.filter(it => it.side === "local"));
+  column("S", el("colS"), items.filter(it => it.side === "server"));
+  el("totL").innerHTML = totals(items.filter(it => it.side === "local"), "L");
+  el("totS").innerHTML = totals(items.filter(it => it.side === "server"), "S");
+  decide();
+  summary();
+  const p = picked();
+  let up = 0, down = 0;
+  for (const it of p) {
+    const v = way(it) === "up" ? it.c.l : it.c.s;
+    if (v && !v.dir && !it.c.from) way(it) === "up" ? up += v.size : down += v.size;
+  }
+  const n = p.filter(it => !it.implied).length;
+  el("apply").textContent = n ? "Sync " + n.toLocaleString() + (n === 1 ? " change" : " changes") : "Sync";
+  el("apply").disabled = busy || !n;
+  el("applyinfo").textContent = n ? "↑ " + fmt(up) + " to the server · ↓ " + fmt(down) + " to this drive" : "";
+  paint();
+}
+
+// What goes out: every ticked item, plus each folder that is itself new or
+// deleted whenever something inside it goes too.
+function picked() {
+  const out = items.filter(it => way(it) && !it.implied), inside = new Set();
+  for (const it of out) {
+    const parts = it.c.key.split("/");
+    for (let i = 1; i < parts.length; i++) inside.add(it.folder + "\u0000" + parts.slice(0, i).join("/"));
+  }
+  return out.concat(items.filter(it => it.implied && way(it) && inside.has(it.id)));
+}
+
+async function loadReview() {
+  review = await api("/api/changes");
+  flatten();
+  draw();
+}
+
+async function scan() {
+  offset = 0;
+  el("log").textContent = "";
+  await post("/api/scan");
+  poll();
+}
+
+el("scan").onclick = scan;
+el("apply").onclick = async () => {
+  const p = picked();
+  let delS = 0, delL = 0;
+  for (const it of p) {
+    if (it.c.dir) continue;
+    if (way(it) === "up" && !it.c.l) delS++;
+    if (way(it) === "down" && !it.c.s) delL++;
+  }
+  const n = p.filter(it => !it.implied).length;
+  if ((delS || delL) && !confirm("Sync " + n + " changes?\n\nThis deletes " +
+      [delS ? delS + " files on the server" : "", delL ? delL + " files on this drive" : ""]
+        .filter(Boolean).join(" and ") + ".")) return;
+  offset = 0;
+  el("log").textContent = "";
+  const r = await post("/api/apply", {picks: p.map(it => ({folder: it.folder, key: it.c.key, way: way(it)}))});
+  if (r.error) alert(r.error);
+  poll();
+};
+el("stop").onclick = () => post("/api/stop");
+el("resync").onclick = async () => {
+  if (!confirm("Rebuild the sync record for every selected folder?\n\n" +
+               "Wherever a file differs, the newer copy replaces the older one, " +
+               "and files deleted on one side since the last sync come back. " +
+               "On these folder sizes it takes a while.")) return;
+  offset = 0;
+  el("log").textContent = "";
+  await post("/api/resync");
+  poll();
+};
+listen(el("colL"));
+listen(el("colS"));
+el("decide").addEventListener("change", e => {
+  const r = e.target;
+  if (r.name && r.dataset.i) {
+    const it = items[+r.dataset.i];
+    if (r.value === it.def) choice.delete(it.id); else choice.set(it.id, r.value);
+    draw();
+  }
+});
+el("decide").addEventListener("click", async e => {
+  const b = e.target.closest("[data-keep]");
+  if (!b || busy) return;
+  const path = b.dataset.keep, g = (review.copies || []).find(g => g.versions.some(v => v.path === path));
+  const rest = g ? g.versions.length - 1 : 0;
+  if (!confirm("Keep " + b.dataset.who.toLowerCase() + "?\n\nIt becomes\n  " + (g ? g.base : path) +
+               "\n\nand the other " + (rest === 1 ? "version is" : rest + " versions are") +
+               " deleted from this drive. Your next sync takes the same change to the server.")) return;
+  const r = await post("/api/resolve", {keep: path});
+  if (r.error) alert(r.error);
+  scan();
+});
+
+// -------------------------------------------------------------- job state
+// A running sync paints onto the list itself: a file on its way gets a bar,
+// a finished one a tick, and a folder row fills up with what is inside it.
+// rclone's stats say what is in flight, the log names what finished. The
+// column that is moving files also gets bytes, speed and time left on top;
+// uploads go under "On this drive", downloads under "On the server".
+const live = new Map();   // item id -> fraction done, while in flight
+const done = new Set();   // item ids this job finished
+const DONE_RE = /^(.+): (?:(?:Multi-thread )?Copied \(.+\)|Deleted|Moved|Updated modification time in destination)$/;
+let job = {}, curFolder = "", lastSide = "S";
+const toServer = f => /^nc[{:]/.test(f.dstFs || "");
+
+function absorb(lines) {
+  for (const line of lines) {
+    const f = /^==> (.+?)(?: {2}\(.*\))?$/.exec(line), m = !f && DONE_RE.exec(line);
+    if (f) curFolder = f[1];
+    else if (m) done.add(curFolder + "\u0000" + m[1].normalize("NFC"));
+  }
+}
+
+// How far along an item is in the running job: 0..1, or null when not in it.
+function frac(it) {
+  if (done.has(it.id)) return 1;
+  if (live.has(it.id)) return live.get(it.id);
+  return job.running && job.kind === "sync" && way(it) ? 0 : null;
+}
+
+function overall(s) {
+  const pct = s.totalBytes > 0 ? Math.min(100, s.bytes / s.totalBytes * 100) : 0, bits = [];
+  if (s.checks) bits.push(s.checks.toLocaleString() + " checked");
+  if (s.transfers) bits.push(s.transfers.toLocaleString() + " done");
+  if (s.deletes) bits.push(s.deletes.toLocaleString() + " deleted");
+  if (s.errors) bits.push('<span class="err">' + s.errors + " errors</span>");
+  return '<div class="pline"><span>' + fmt(s.bytes || 0) +
+    (s.totalBytes > 0 ? " of " + fmt(s.totalBytes) : "") + "</span><span>" +
+    fmt(s.speed || 0) + "/s" + (s.eta ? " &middot; " + dur(s.eta) + " left" : "") + "</span></div>" +
+    (s.totalBytes > 0 ? '<div class="pbar"><i style="width:' + pct.toFixed(1) + '%"></i></div>' : "") +
+    (bits.length ? '<div class="count" style="margin-top:8px">' + bits.join(" &middot; ") + "</div>" : "");
+}
+
+// Updates the bars in place, so the list is not rebuilt under your pointer.
+function paint() {
+  const s = job.running ? job.stats : null;
+  const t = s ? (s.transferring || []).filter(f => f && f.name) : [];
+  const side = job.phase === "up" ? "L" : job.phase === "down" ? "S"
+    : t.length ? (toServer(t[0]) ? "L" : "S") : lastSide;
+  lastSide = side;
+  for (const k of ["L", "S"]) {
+    const top = el("prog" + k), box = el("col" + k);
+    top.className = s && k === side ? "prog on" : "prog";
+    top.innerHTML = s && k === side ? overall(s) : "";
+    box.querySelectorAll(".row").forEach(row => {
+      const cb = row.firstElementChild;
+      const list = (cb.dataset.i ? [items[+cb.dataset.i]] : under(box._nodes[+cb.dataset.n]))
+        .filter(it => !it.c.dir);
+      let n = 0, fin = 0, tot = 0, got = 0;
+      for (const it of list) {
+        const f = frac(it);
+        if (f === null) continue;
+        const v = way(it) === "up" ? it.c.l : it.c.s, w = v && !it.c.from ? Math.max(v.size, 1) : 1;
+        n++; tot += w; got += f * w; if (f === 1) fin++;
+      }
+      const rp = row.querySelector(".rp");
+      rp.hidden = !n;
+      row.classList.toggle("fin", n > 0 && fin === n);
+      if (!n) return;
+      rp.firstChild.firstChild.style.width = (100 * got / tot).toFixed(1) + "%";
+      rp.lastChild.textContent = cb.dataset.i ? (fin ? "✓ done" : Math.floor(100 * got / tot) + "%")
+        : fin.toLocaleString() + " of " + n.toLocaleString();
+    });
+  }
+}
+
+let offset = 0, timer = null;
+const DOING = {scan: "checking both sides…", sync: "syncing…", resync: "fresh sync…"};
+
+async function poll() {
+  const d = await api("/api/joblog?offset=" + offset);
+  if (offset === 0) { done.clear(); curFolder = ""; }
+  if (d.lines && d.lines.length) {
+    absorb(d.lines);
+    const pre = el("log");
+    if (offset === 0) pre.textContent = "";
+    pre.textContent += d.lines.join("\n") + "\n";
+    pre.scrollTop = pre.scrollHeight;
+  }
+  offset = d.total;
+  live.clear();
+  for (const f of (d.running && d.stats && d.stats.transferring) || []) {
+    if (f && f.name) live.set(curFolder + "\u0000" + f.name.normalize("NFC"),
+                              f.size > 0 ? f.bytes / f.size : (f.percentage || 0) / 100);
+  }
+  job = d;
+  const was = busy;
+  busy = d.running;
+  el("scan").disabled = busy; el("stop").disabled = !busy; el("resync").disabled = busy;
+  el("jobstate").innerHTML = busy
+    ? '<span class="spin"></span> ' + (DOING[d.kind] || "running")
+    : (d.rc ? '<span class="err">' + ({scan: "check", sync: "sync", resync: "fresh sync"}[d.kind] || "run") +
+       " failed (exit " + d.rc + ") — see the log</span>" : "");
+  if (busy && !timer) timer = setInterval(poll, 700);
+  if (!busy && timer) { clearInterval(timer); timer = null; }
+  if (was && !busy) {
+    done.clear();
+    if (d.rc) el("logbox").open = true;
+    refreshRuns();
+    if (d.kind === "resync") { scan(); return; }
+    await loadReview();
+  } else if (was !== busy) draw();
+  else paint();
+}
+
+// ----------------------------------------------------------- folder picker
+async function load(path) {
+  const n = node(path);
+  const d = await api("/api/ls?path=" + encodeURIComponent(path));
+  if (d.error) { flash(d.error, true); return; }
+  n.children = d.dirs;
+  n.loaded = true;
+}
+
+function render() {
+  const t = el("tree");
+  t.innerHTML = "";
+  const walk = (path, depth) => {
+    const n = node(path);
+    for (const name of n.children) {
+      const full = path ? path + "/" + name : name;
+      const c = node(full);
+      const row = document.createElement("div");
+      row.className = "row";
+      row.style.paddingLeft = (14 + depth * 16) + "px";
+
+      const tw = document.createElement("span");
+      tw.className = "tw";
+      tw.textContent = c.open ? "▾" : "▸";
+      tw.onclick = async () => {
+        c.open = !c.open;
+        if (c.open && !c.loaded) { tw.textContent = "…"; await load(full); }
+        render();
+      };
+      row.appendChild(tw);
+
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = selected.has(full);
+      cb.onchange = () => {
+        if (cb.checked) {
+          for (const s of [...selected]) {
+            if (full.startsWith(s + "/") || s.startsWith(full + "/")) selected.delete(s);
+          }
+          selected.add(full);
+        } else selected.delete(full);
+        render();
+      };
+      row.appendChild(cb);
+
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = name;
+      row.appendChild(nm);
+
+      if (lastRuns[full]) {
+        const lr = document.createElement("span");
+        lr.className = "lr";
+        lr.textContent = "synced " + lastRuns[full];
+        row.appendChild(lr);
+      }
+
+      const sz = document.createElement("span");
+      sz.className = "sz";
+      if (c.size === null) {
+        const b = document.createElement("button");
+        b.textContent = "size";
+        b.onclick = async () => {
+          b.textContent = "…"; b.disabled = true;
+          const d = await api("/api/size?path=" + encodeURIComponent(full));
+          c.size = d.error ? -1 : d.bytes;
+          c.count = d.count;
+          render();
+        };
+        sz.appendChild(b);
+      } else if (c.size < 0) {
+        sz.textContent = "—";
+      } else {
+        sz.textContent = fmt(c.size) + "  ·  " + c.count + " files";
+      }
+      row.appendChild(sz);
+      t.appendChild(row);
+
+      if (c.open) walk(full, depth + 1);
+    }
+  };
+  walk("", 0);
+  if (!node("").children.length) {
+    t.innerHTML = '<div class="row"><span class="count">nothing found on the server</span></div>';
+  }
+  const bad = overlap();
+  el("sel").innerHTML = selected.size + " selected" +
+    (bad ? ' <span class="err">— ' + bad[0] + " contains " + bad[1] + "</span>" : "");
+  el("save").disabled = !!bad;
+}
+
+function overlap() {
+  const a = [...selected];
+  for (const x of a) for (const y of a)
+    if (x !== y && y.startsWith(x + "/")) return [x, y];
+  return null;
+}
+
+function flash(msg, bad) {
+  el("pickmsg").textContent = msg;
+  el("pickmsg").className = bad ? "err" : "count";
+}
+
+async function refreshRuns() {
+  const d = await api("/api/state");
+  lastRuns = d.lastRuns || {};
+  render();
+}
+
+el("save").onclick = async () => {
+  const d = await post("/api/selection", {paths: [...selected].sort()});
+  if (!d.error) { saved = d.count; summary(); }
+  flash(d.error ? d.error : "Saved " + d.count + (d.count === 1 ? " folder." : " folders."), !!d.error);
+  if (!d.error && !busy) scan();
+};
+
+(async function init() {
+  const d = await api("/api/state");
+  el("remote").textContent = d.remote || "(no rclone.conf)";
+  el("repo").textContent = d.repo;
+  lastRuns = d.lastRuns || {};
+  selected = new Set(d.selection || []);
+  saved = selected.size;
+  const w = [];
+  if (!d.hasRclone) w.push("rclone is not installed — install it, then reload this page.");
+  if (!d.hasConf) w.push("No rclone.conf yet. Run:  bash _sync/setup.sh");
+  if (!d.mounted) w.push("The drive does not look mounted — .repo-id is missing. New here? Run:  bash _sync/setup.sh");
+  if (w.length) el("warn").innerHTML = '<div class="note">' + w.join("<br>") + "</div>";
+  await loadReview();
+  await poll();
+  const ready = d.hasConf && d.hasRclone && d.mounted;
+  if (ready && !busy && (d.selection || []).length) scan();
+  if (d.hasConf && d.hasRclone) { await load(""); render(); }
+  else el("tree").innerHTML = '<div class="row"><span class="count">nothing to show yet</span></div>';
+})();
+</script></body></html>
+"""
+
+# ------------------------------------------------------------------ server
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "ncweb"
+
+    def log_message(self, *a):  # quiet
+        pass
+
+    # -- guards ----------------------------------------------------------
+    def _ok_host(self):
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("127.0.0.1", "localhost", "[::1]", "::1")
+
+    def _q(self):
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+    def _authed(self):
+        return self._q().get("t", [""])[0] == TOKEN
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj))
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except ValueError:
+            return {}
+
+    # -- routes ----------------------------------------------------------
+    def do_GET(self):
+        if not self._ok_host():
+            return self._send(403, "forbidden", "text/plain")
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/" and self._authed():
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if not self._authed():
+            return self._send(403, "bad or missing token", "text/plain")
+
+        if path == "/api/state":
+            sel = read_selection()
+            url = ""
+            if os.path.exists(CONF):
+                with open(CONF, encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.startswith("url ="):
+                            url = line.split("=", 1)[1].strip()
+            runs = {p: last_run(p) for p in sel if last_run(p)}
+            return self._json({
+                "repo": REPO, "remote": url, "selection": sel,
+                "lastRuns": runs, "hasConf": os.path.exists(CONF),
+                "hasRclone": have_rclone(), "mounted": os.path.exists(REPO_ID),
+            })
+
+        if path == "/api/ls":
+            p = self._q().get("path", [""])[0]
+            if not os.path.exists(CONF):
+                return self._json({"error": "no rclone.conf"})
+            try:
+                rc, out, err = rclone(["lsjson", "nc:" + p, "--dirs-only"], timeout=120)
+            except subprocess.TimeoutExpired:
+                return self._json({"error": "server timed out listing " + (p or "/")})
+            if rc != 0:
+                return self._json({"error": (err or "rclone failed").strip()[:400]})
+            try:
+                items = json.loads(out or "[]")
+            except ValueError:
+                return self._json({"error": "could not parse rclone output"})
+            names = sorted([i["Name"] for i in items if i.get("IsDir")],
+                           key=str.lower)
+            return self._json({"dirs": names})
+
+        if path == "/api/size":
+            p = self._q().get("path", [""])[0]
+            try:
+                rc, out, err = rclone(["size", "nc:" + p, "--json"], timeout=600)
+            except subprocess.TimeoutExpired:
+                return self._json({"error": "timed out"})
+            if rc != 0:
+                return self._json({"error": (err or "failed").strip()[:200]})
+            try:
+                d = json.loads(out)
+            except ValueError:
+                return self._json({"error": "bad output"})
+            return self._json({"bytes": d.get("bytes", 0), "count": d.get("count", 0)})
+
+        if path == "/api/changes":
+            folders = REVIEW["folders"]
+            return self._json({
+                "folders": [folders[f] for f in read_selection() if f in folders],
+                "copies": REVIEW["copies"], "more": REVIEW["more"], "at": REVIEW["at"]})
+
+        if path == "/api/joblog":
+            try:
+                off = int(self._q().get("offset", ["0"])[0])
+            except ValueError:
+                off = 0
+            lines, total, running, rc, stats, kind, phase = JOB.tail(off)
+            return self._json({"lines": lines, "total": total, "running": running,
+                               "rc": rc, "stats": stats, "kind": kind, "phase": phase})
+
+        return self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        if not self._ok_host():
+            return self._send(403, "forbidden", "text/plain")
+        if not self._authed():
+            return self._send(403, "bad or missing token", "text/plain")
+        path = urllib.parse.urlparse(self.path).path
+        body = self._body()
+
+        if path == "/api/selection":
+            paths = [str(p).strip().strip("/") for p in body.get("paths", [])]
+            paths = [p for p in paths if p]
+            bad = overlaps(paths)
+            if bad:
+                return self._json({"error": "%s contains %s - pick one" % bad})
+            write_selection(paths)
+            return self._json({"count": len(paths)})
+
+        if path in ("/api/scan", "/api/apply", "/api/resync"):
+            if not os.path.exists(REPO_ID):
+                return self._json({"error": "drive not mounted"}, 400)
+            if path == "/api/scan":
+                return self._json({"started": JOB.start("scan", scan_task, log=False)})
+            if path == "/api/resync":
+                return self._json({"started": JOB.start("resync", resync_task)})
+            sel, picks = set(read_selection()), {}
+            for p in body.get("picks", []):
+                if not isinstance(p, dict) or p.get("folder") not in sel or \
+                        p.get("way") not in ("up", "down") or not isinstance(p.get("key"), str):
+                    return self._json({"error": "bad pick: %r" % (p,)}, 400)
+                picks.setdefault(p["folder"], {})[p["key"]] = p["way"]
+            return self._json({"started": JOB.start(
+                "sync", lambda job: apply_task(job, picks))})
+
+        if path == "/api/resolve":
+            if JOB.running:
+                return self._json({"error": "a sync is running"}, 409)
+            try:
+                err = keep_version(str(body.get("keep", "")))
+            except OSError as exc:
+                err = str(exc)
+            return self._json({"error": err} if err else {"ok": True}, 400 if err else 200)
+
+        if path == "/api/stop":
+            JOB.stop()
+            return self._json({"ok": True})
+
+        return self._send(404, "not found", "text/plain")
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    if not os.path.isdir(SELF):
+        sys.exit("cannot locate _sync directory")
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    httpd = Server(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/?t=%s" % (port, TOKEN)
+    print("ncweb serving at:\n  %s\n" % url)
+    print("Only this machine can reach it. Ctrl-C to stop.")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+if __name__ == "__main__":
+    main()

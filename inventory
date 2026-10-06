@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Ask the SERVER what is there and how big it is, so you can choose folders
+# for folders.txt without guessing. Reads nothing from the File Provider mount.
+#
+#   bash inventory          top level
+#   bash inventory Photos   inside that folder
+#
+set -eu
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="$SELF/rclone.conf"
+BASE="${1:-}"
+
+command -v rclone >/dev/null 2>&1 || { echo "rclone is not installed."; exit 1; }
+[ -f "$CONF" ] || { echo "No rclone.conf yet. Run: bash $SELF/setup.sh"; exit 1; }
+
+echo "Listing nc:$BASE - sizes come from the server, this can take a moment."
+echo
+
+rclone --config "$CONF" lsd "nc:$BASE" 2>/dev/null \
+| awk '{ $1=""; $2=""; $3=""; $4=""; sub(/^ +/,""); print }' \
+| while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    line="$(rclone --config "$CONF" size "nc:${BASE:+$BASE/}$d" --json 2>/dev/null)"
+    bytes="$(printf '%s' "$line" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')"
+    count="$(printf '%s' "$line" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')"
+    [ -n "$bytes" ] || { printf '  %-44s %s\n' "$d" "?"; continue; }
+    printf '  %-44s %8.2f GB  %6s files\n' "$d" "$(echo "$bytes" | awk '{print $1/1073741824}')" "${count:-?}"
+  done
+
+echo
+echo "Add the ones you want to: $SELF/folders.txt"

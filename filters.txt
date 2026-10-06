@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------
+# rclone filter rules for the Nextcloud repo.
+# "-" excludes. Order matters: first match wins.
+# Anything excluded here is never uploaded AND never downloaded.
+# ---------------------------------------------------------------
+
+# --- macOS junk (exFAT has no xattrs, so macOS writes ._ sidecars) ---
+- .DS_Store
+- ._*
+- .Spotlight-V100/**
+- .DocumentRevisions-V100/**
+- .TemporaryItems/**
+- .fseventsd/**
+- .Trashes/**
+- .apdisk
+- .VolumeIcon.icns
+
+# --- Windows / exFAT volume junk ---
+- $RECYCLE.BIN/**
+- System Volume Information/**
+- desktop.ini
+- Thumbs.db
+
+# --- Linux ---
+- .Trash-*/**
+- .directory
+
+# --- editor / office lock + temp files ---
+- ~$*
+- .~lock.*
+- *.tmp
+- *.temp
+- *.swp
+- *.swo
+- *~
+
+# --- partial transfers from the old Nextcloud client ---
+- *.part
+- *.~*
+- .owncloudsync.log*
+- ._sync_*.db*
+- .sync_*.db*
+- .sync-exclude.lst
+
+# --- our own tooling: never sync the sync machinery ---
+- _sync/**
+
+# --- add your own exclusions below ---
+# - */node_modules/**
+# - *.blend1

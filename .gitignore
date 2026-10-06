@@ -1,0 +1,10 @@
+# yours, never published: credentials, your folder list, sync record, logs
+rclone.conf
+folders.txt
+folders.txt.tmp
+filters.txt.md5
+state/
+logs/
+*.bak
+.DS_Store
+._*

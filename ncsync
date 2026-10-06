@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# ncsync - manual, selective Nextcloud sync onto a portable exFAT drive.
+# Works on macOS and Linux. Nothing runs in the background; you run this.
+#
+#   bash ncsync                 sync every folder listed in folders.txt
+#   bash ncsync -n              dry run - show what would change, touch nothing
+#   bash ncsync Documents       sync just that one folder
+#   bash ncsync --resync X      re-establish the baseline for folder X
+#   bash ncsync --status        show what is configured and when it last ran
+#
+set -u
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$SELF")"
+FILES="$REPO/files"
+CONF="$SELF/rclone.conf"
+FILTERS="$SELF/filters.txt"
+FOLDERS="$SELF/folders.txt"
+STATE="$SELF/state"
+LOGS="$SELF/logs"
+MARKERS="$STATE/initialised"
+REMOTE="nc"
+
+c_red=''; c_grn=''; c_ylw=''; c_dim=''; c_off=''
+if [ -t 1 ]; then
+  c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s\n' "${c_grn}$*${c_off}"; }
+warn() { printf '%s\n' "${c_ylw}$*${c_off}"; }
+die()  { printf '%s\n' "${c_red}$*${c_off}" >&2; exit 1; }
+
+# ---------------------------------------------------------------- preflight
+command -v rclone >/dev/null 2>&1 || die "rclone is not installed.
+  macOS:  brew install rclone
+  Linux:  curl https://rclone.org/install.sh | sudo bash"
+# 1.74.2 fixed --conflict-loser pathname with --conflict-resolve newer, both
+# used below. Distro packages (apt) are usually far older.
+RCV="$(rclone version 2>/dev/null | sed -n '1s/^rclone v//p')"
+printf '1.74.2\n%s\n' "$RCV" | sort -V -C || die "rclone $RCV is too old - ncsync needs 1.74.2 or newer.
+  macOS:  brew upgrade rclone
+  Linux:  curl https://rclone.org/install.sh | sudo bash"
+
+[ -f "$CONF" ] || die "No rclone.conf yet. Run:  bash '$SELF/setup.sh'"
+
+# Is the drive actually mounted, or are we writing into a bare mountpoint?
+[ -f "$REPO/.repo-id" ] || die "This does not look like the mounted repo.
+Expected marker: $REPO/.repo-id
+Mount the drive first. New here? Run:  bash '$SELF/setup.sh'"
+mkdir -p "$FILES" "$STATE" "$LOGS" "$MARKERS"
+
+# ---------------------------------------------------------------- arguments
+DRYRUN=0; RESYNC=0; STATUS=0; ONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRYRUN=1 ;;
+    --resync)     RESYNC=1 ;;
+    --status)     STATUS=1 ;;
+    -h|--help)    sed -n '2,12p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -*)           die "Unknown option: $1" ;;
+    *)            ONLY="$1" ;;
+  esac
+  shift
+done
+
+slug() { printf '%s' "$1" | tr '/ ' '__'; }
+
+# ------------------------------------------------------------------ folders
+LIST=""
+if [ -n "$ONLY" ]; then
+  LIST="$ONLY"
+else
+  LIST="$(sed -e 's/#.*$//' -e 's/[[:space:]]*$//' "$FOLDERS" 2>/dev/null | grep -v '^[[:space:]]*$' || true)"
+fi
+[ -n "$LIST" ] || die "Nothing to sync yet. Pick folders with:  python3 '$SELF/ncweb'
+or list them, one per line, in: $FOLDERS"
+
+# ------------------------------------------------------------------- status
+if [ "$STATUS" = "1" ]; then
+  say "repo:    $REPO"
+  say "remote:  $(sed -n 's|^url = ||p' "$CONF")"
+  say ""
+  printf '%s\n' "$LIST" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    m="$MARKERS/$(slug "$f")"
+    if [ -f "$m" ]; then printf '  %-40s last run %s\n' "$f" "$(cat "$m")"
+    else                 printf '  %-40s %s\n' "$f" "${c_ylw}never synced - needs --resync${c_off}"; fi
+  done
+  exit 0
+fi
+
+# ------------------------------------------------------- rclone flag blocks
+# exFAT cannot store the characters Nextcloud allows, so let rclone encode
+# them; and exFAT timestamps are coarse, hence the 2s modify window.
+COMMON=(
+  --config "$CONF"
+  --filters-file "$FILTERS"
+  --local-encoding "Slash,BackSlash,Colon,Question,Asterisk,Pipe,LtGt,DoubleQuote,Ctl,RightSpace,RightPeriod,InvalidUtf8,Dot"
+  --modify-window 2s
+  --transfers "${NCSYNC_TRANSFERS:-8}"
+  --checkers "${NCSYNC_CHECKERS:-16}"
+  --retries 3
+  --low-level-retries 10
+  --contimeout 30s
+  --timeout 120s
+  --webdav-nextcloud-chunk-size 32Mi
+  # The server recycles HTTP/2 connections (GOAWAY) with uploads still in
+  # flight, and --resync never retries those. HTTP/1.1 closes between requests.
+  --disable-http2
+)
+
+BISYNC=(
+  --workdir "$STATE"
+  # Changed on both sides: the newer copy keeps the name, the older one is
+  # kept beside it as name.ext.conflict-<date>1 (from the server) or ...2
+  # (from this drive). Without it both copies get renamed and the original
+  # name is left empty.
+  --conflict-resolve newer
+  --conflict-loser pathname
+  --conflict-suffix "conflict-{DateOnly}"
+  --max-delete "${NCSYNC_MAX_DELETE:-25}"
+  --resilient
+  --recover
+  --create-empty-src-dirs
+)
+
+[ -t 1 ] && COMMON+=( --progress )
+[ "$DRYRUN" = "1" ] && COMMON+=( --dry-run )
+
+STAMP="$(date +%Y-%m-%d_%H-%M-%S)"
+LOG="$LOGS/$STAMP.log"
+if [ "${NCSYNC_JSON:-0}" = "1" ]; then
+  # Launched by ncweb: stream machine-readable progress on stdout instead of
+  # writing a log file, so the browser can show which file is moving.
+  COMMON+=( --use-json-log --stats 1s --stats-log-level NOTICE --log-level INFO )
+else
+  COMMON+=( --log-file "$LOG" --log-level INFO )
+fi
+
+# --------------------------------------------------------------------- run
+FAILFLAG="$STATE/.last-run-failed"
+rm -f "$FAILFLAG"
+printf '%s\n' "$LIST" | while IFS= read -r folder; do
+  [ -n "$folder" ] || continue
+  local_dir="$FILES/$folder"
+  marker="$MARKERS/$(slug "$folder")"
+  mkdir -p "$local_dir"
+
+  mode=""
+  if [ "$RESYNC" = "1" ] || [ ! -f "$marker" ]; then
+    # Where a file differs keep the newer copy, not the server's: the drive
+    # has no version history, and newer local work would be overwritten.
+    mode="--resync-mode newer"
+    warn "==> $folder  (establishing baseline)"
+  else
+    say "==> $folder"
+  fi
+
+  # rclone names its state files after both paths joined together, verbatim.
+  # Handing it the local side relative to files/ keeps that name the same
+  # wherever the drive is mounted; an absolute path orphaned every baseline
+  # when the volume was renamed. exFAT caps one filename at 255 bytes and
+  # rclone reports the ENAMETOOLONG as a bogus "prior lock file found", so
+  # very deep folders fall back to just their last path component.
+  # ponytail: 235 = 255 minus rclone's longest suffix, .path1.lst-dry-old.
+  runin="$FILES"; p2="$folder"
+  sess="$(printf 'nc:%s..local:%s' "$folder" "$p2" | tr ':/' '__')"
+  if [ ${#sess} -gt 235 ]; then
+    runin="$(dirname "$local_dir")"; p2="$(basename "$local_dir")"
+    sess="$(printf 'nc:%s..local:%s' "$folder" "$p2" | tr ':/' '__')"
+    if [ ${#sess} -gt 235 ]; then
+      warn "    FAILED - path is too deep for rclone's state files (${#sess} of 235 chars)"
+      warn "    sync a shallower parent folder instead"
+      : > "$FAILFLAG"
+      continue
+    fi
+  fi
+
+  # Compare by size and date like the Nextcloud app: seconds, not a checksum
+  # of the whole drive (rclone still checksums whatever it copies). Listings
+  # from before this hold no dates (0001-01-01), and rclone keeps unchanged
+  # entries as they are, so those stay on full checksums until a --resync.
+  # If exFAT dates move wholesale (daylight saving, another OS), every file
+  # looks changed, and the server has no checksum for half of them to prove
+  # otherwise: .repo-id never changes, so stop if its date moved.
+  cmp="--compare size,modtime"
+  seen="$STATE/$sess.drive-date"; now="$(date -r "$REPO/.repo-id" +%s)"
+  if [ -n "$mode" ]; then :
+  elif grep -q '^- .* 0001-01-01T' "$STATE/$sess.path2.lst" 2>/dev/null; then
+    cmp="--compare size,checksum"
+  elif [ -f "$seen" ] && [ "$(cat "$seen")" != "$now" ]; then
+    d=$((now - $(cat "$seen")))
+    warn "    STOPPED - this drive's file dates moved by $(printf '%+d' "$d")s since the last sync"
+    warn "    (daylight saving? another OS?), so every file would look changed."
+    warn "    Nothing was copied. Shift them by $(printf '%+d' $((-d)))s - see 'Dates moved' in the README."
+    : > "$FAILFLAG"
+    continue
+  fi
+
+  if ( cd "$runin" && rclone bisync "$REMOTE:$folder" "$p2" "${BISYNC[@]}" ${mode:+$mode} $cmp "${COMMON[@]}" ); then
+    [ "$DRYRUN" = "1" ] || { date '+%Y-%m-%d %H:%M' > "$marker"; echo "$now" > "$seen"; }
+    ok "    done"
+  else
+    : > "$FAILFLAG"
+    # under ncweb there is no $LOG file; the page shows and saves the output
+    if [ "${NCSYNC_JSON:-0}" = "1" ]; then warn "    FAILED"; else warn "    FAILED - see $LOG"; fi
+    warn "    if it says the listings are out of sync:  bash ncsync --resync '$folder'"
+  fi
+done
+
+say ""
+[ "${NCSYNC_JSON:-0}" = "1" ] || say "${c_dim}log: $LOG${c_off}"
+[ "$DRYRUN" = "1" ] && say "${c_ylw}dry run - nothing was changed${c_off}"
+if [ -f "$FAILFLAG" ]; then
+  rm -f "$FAILFLAG"
+  die "one or more folders failed - see the log above"
+fi
+exit 0
