@@ -11,6 +11,8 @@ holding a few large project folders from a slow Nextcloud server. The
 Nextcloud desktop client rescans everything on every launch and cannot share
 one sync folder between two computers. This can.
 
+![A sync in progress: on the left, this drive's changes have gone up to the server; on the right, a render sequence is coming down, eight frames at a time](docs/syncing.png)
+
 ```
 nextcloud/            any folder on the drive, any name
   _sync/              this repository
@@ -132,6 +134,8 @@ An alias in your shell config saves typing:
 ## The browser page
 
     python3 _sync/ncweb
+
+![The page before a sync: two files changed on both sides wait for a decision, a conflict copy from an earlier run, and each side's changes as a folder tree](docs/review.png)
 
 The page opens on **Changes since the last sync**, with two columns:
 

@@ -611,6 +611,8 @@ class Job:
         """A child process with its output streamed to the page; its exit code."""
         if self.stopping:
             return 1
+        with self.lock:
+            self.stats = None  # not the last run's totals under the next one's column
         self.proc = subprocess.Popen(
             argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding="utf-8", errors="replace", bufsize=1, env=env)
