@@ -42,6 +42,9 @@
 - .sync_*.db*
 - .sync-exclude.lst
 
+# --- rclone's own unfinished downloads, left behind when a sync is cut off ---
+- *.partial
+
 # --- our own tooling: never sync the sync machinery ---
 - _sync/**
 

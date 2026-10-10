@@ -424,6 +424,13 @@ def innermost(dirs, files):
 
 REVIEW = {"folders": {}, "copies": [], "more": False, "at": None}
 
+# rclone finds the files it is told to copy one of two ways. With
+# --no-traverse it asks for each by name, a request apiece: right for three
+# files out of a folder of 5,000 frames, but a first sync of 340,000 files
+# spent an hour asking before the first byte moved. Past this many it lists
+# the folders they are in instead, which costs no more than one check does.
+LOOKUPS = 1000
+
 
 def review(folder):
     s = session(folder)
@@ -509,8 +516,9 @@ def apply_task(job, picks):
         for way, (a, b) in ends.items():
             job.phase = way
             if todo[way, "copy"]:
-                ok &= job.rclone(["copy", a, b, "--no-traverse"], runin,
-                                 [n for _, n in todo[way, "copy"]])
+                names = [n for _, n in todo[way, "copy"]]
+                ok &= job.rclone(["copy", a, b] + ["--no-traverse"] * (len(names) <= LOOKUPS),
+                                 runin, names)
         for way, (a, b) in ends.items():
             job.phase = way
             if todo[way, "delete"]:
@@ -533,6 +541,8 @@ def apply_task(job, picks):
             continue
         n1, n2 = reconcile(b1, b2, srv, loc)
         if n1:  # bisync refuses an empty listing
+            # ncsync makes state/ when it runs; a first sync made here has not
+            os.makedirs(MARKERS, exist_ok=True)
             save_listing(prefix + ".path1.lst", n1)
             save_listing(prefix + ".path2.lst", n2)
             # bisync records the filters' hash only on --resync, and refuses
@@ -542,7 +552,6 @@ def apply_task(job, picks):
                     out.write(hashlib.md5(fh.read()).hexdigest())
             with open(prefix + ".drive-date", "w") as fh:
                 fh.write("%d\n" % os.stat(REPO_ID).st_mtime)
-            os.makedirs(MARKERS, exist_ok=True)
             with open(os.path.join(MARKERS, slug(folder)), "w", encoding="utf-8") as fh:
                 fh.write(time.strftime("%Y-%m-%d %H:%M") + "\n")
         left = diff(n1, n2, srv, loc)
