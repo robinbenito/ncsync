@@ -2,7 +2,7 @@
 """python3 _sync/test_ncweb.py - checks conflict handling, path safety, and
 end to end (needs rclone) that syncing only some changes leaves listings the
 next ncsync run agrees with, on a throwaway repo whose "server" is a folder."""
-import importlib.util, os, re, shutil, subprocess, sys, tempfile
+import importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_loader(
@@ -107,6 +107,18 @@ for n, t in [("keep.txt", "same"), ("srvmod.txt", "v1"), ("locmod.txt", "v1"),
              ("srvdel.txt", "x"), ("locdel.txt", "x"), ("both.txt", "v1"),
              ("held.txt", "v1"), ("gone/x.txt", "x"), ("gone/sub/y.txt", "y"), (odd, "colon")]:
     put(os.path.join(S, n), t)
+
+# the first sync made from the page, before ncsync ever ran: there is no
+# state/ yet, and too many files to ask for one by one, so rclone lists the
+# folders - and still copies only what was picked
+nc.REVIEW["folders"]["proj"] = r = nc.review("proj")
+few, nc.LOOKUPS, job = nc.LOOKUPS, 3, nc.Job()
+picks = {c["key"]: "down" for c in r["changes"] if c["key"] != "held.txt"}
+assert nc.apply_task(job, {"proj": picks}) == 0, "\n".join(job.lines)
+assert get(os.path.join(D, "gone", "sub", "y.txt")) == "y" and get(os.path.join(D, "held.txt")) is None
+assert kinds() == {"held.txt": (None, "new")}, kinds()
+nc.LOOKUPS = few
+
 rc, out, log = ncsync()
 assert rc == 0 and "done" in out, out + (log or "")
 assert get(os.path.join(D, odd)) == "colon" and kinds() == {}, kinds()
