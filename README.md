@@ -158,6 +158,8 @@ a deletion plus a new file.
 
 A file changed on **both** sides is never decided for you. It is listed at
 the top with both versions side by side: pick one, or leave it for later.
+Several in one folder are listed under that folder, whose own switch decides
+them all at once.
 The conflict copies left by an `ncsync` run (see [Conflicts](#conflicts))
 are listed there too. Keep one: it gets the original name back, and the other
 copies are deleted from the drive, and from the server on your next sync.

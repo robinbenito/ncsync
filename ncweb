@@ -857,6 +857,14 @@ label.ver{cursor:pointer}
 .seg label:has(input:checked) .m{color:inherit;opacity:.85}
 .seg label:has(input[value=""]:checked){background:var(--line);color:var(--ink)}
 .seg label:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:-2px}
+.cg{margin-top:10px}
+.cg>.cf{margin-top:0;border-radius:0}
+.cg>.cf+.cf{border-top:0;padding-left:40px}
+.cg>.cf+.cf .cfn{font-size:13px;font-weight:500}
+.cg>.cf:first-child{border-radius:8px 8px 0 0}
+.cg>.cf:last-child{border-radius:0 0 8px 8px}
+.cg>.cf:only-child{border-radius:8px}
+.cgh .cfn{cursor:pointer}
 </style></head><body>
 <header>
   <button id="sidebtn" aria-controls="side" aria-expanded="true" title="Show or hide the folder list">&#9776; Folders</button>
@@ -1120,23 +1128,71 @@ function listen(box) {
   });
 }
 
-// One row per conflict: the name, its folder underneath, and a three-way
-// switch - the server's version, leave it, or this drive's.
-function conflictCard(it) {
-  const w = way(it), l = it.c.l, s = it.c.s;
-  const newer = l && s && Math.abs(l.mtime - s.mtime) >= 2000 ? (l.mtime > s.mtime ? "up" : "down") : "";
+// A three-way switch: the server's version, leave it, or this drive's.
+// w is the way it shows, m(way) the small print under each side.
+function seg(name, data, label, w, m) {
+  const opt = (value, who) =>
+    '<label><input type="radio" name="' + name + '" ' + data + ' value="' + value + '"' +
+    (w === value ? " checked" : "") + (busy ? " disabled" : "") + "><b>" + who + "</b>" +
+    (value ? '<span class="m">' + m(value) + "</span>" : "") + "</label>";
+  return '<div class="seg" role="radiogroup" aria-label="' + esc(label) + '">' +
+    opt("down", "Server") + opt("", "Later") + opt("up", "This drive") + "</div>";
+}
+
+// The side whose copy is newer, as a way: "up", "down", or "" when neither is.
+function newerWay(it) {
+  const l = it.c.l, s = it.c.s;
+  return l && s && Math.abs(l.mtime - s.mtime) >= 2000 ? (l.mtime > s.mtime ? "up" : "down") : "";
+}
+
+// One row per conflict: the name, its folder underneath unless the row sits
+// under that folder's own (inGroup), and the switch.
+function conflictCard(it, inGroup) {
+  const l = it.c.l, s = it.c.s, newer = newerWay(it);
   const same = l && s && !l.dir && !s.dir && l.size === s.size;
   const full = it.folder + "/" + it.c.path, i = full.lastIndexOf("/");
-  const opt = (value, who, v) =>
-    '<label><input type="radio" name="c' + it.i + '" data-i="' + it.i + '" value="' + value + '"' +
-    (w === value ? " checked" : "") + (busy ? " disabled" : "") + "><b>" + who + "</b>" +
-    (value ? '<span class="m">' + (!v ? "deleted" : v.dir ? "folder" : fmt(v.size) + " · " + when(v.mtime)) +
-      (newer === value ? " · newer" : "") + "</span>" : "") + "</label>";
+  const note = (inGroup ? [] : ["in " + esc(full.slice(0, i))])
+    .concat(same ? ["same size on both sides, maybe the same file"] : []).join(" · ");
   return '<div class="cf c3"><div class="cfh"><div class="cfn">' + esc(full.slice(i + 1)) + "</div>" +
-    '<div class="cfp">in ' + esc(full.slice(0, i)) +
-    (same ? " · same size on both sides, maybe the same file" : "") + "</div></div>" +
-    '<div class="seg" role="radiogroup" aria-label="which version of ' + esc(full.slice(i + 1)) + '">' +
-    opt("down", "Server", s) + opt("", "Later") + opt("up", "This drive", l) + "</div></div>";
+    (note ? '<div class="cfp">' + note + "</div>" : "") + "</div>" +
+    seg("c" + it.i, 'data-i="' + it.i + '"', "which version of " + full.slice(i + 1), way(it), v => {
+      const e = v === "up" ? l : s;
+      return (!e ? "deleted" : e.dir ? "folder" : fmt(e.size) + " · " + when(e.mtime)) +
+        (newer === v ? " · newer" : "");
+    }) + "</div>";
+}
+
+// Conflicts are grouped by the folder they are in. A folder with several gets
+// a row of its own on top: its switch decides them all in one go, and each
+// file's switch underneath still overrides it. Twelve or fewer start open,
+// like the folders in the two columns.
+let groups = [];
+
+function group(cs) {
+  const by = new Map();
+  for (const it of cs) {
+    const full = it.folder + "/" + it.c.path, dir = full.slice(0, full.lastIndexOf("/"));
+    if (!by.has(dir)) by.set(dir, {dir, id: "C" + dir, items: []});
+    by.get(dir).items.push(it);
+  }
+  return [...by.values()];
+}
+
+function conflictGroup(g, n) {
+  const k = g.items.length;
+  if (k === 1) return conflictCard(g.items[0]);
+  const ways = new Set(g.items.map(way)), i = g.dir.lastIndexOf("/");
+  const isOpen = open.has(g.id) ? open.get(g.id) : k <= 12;
+  return '<div class="cg"><div class="cf c3 cgh">' +
+    '<button class="tw" data-c="' + n + '" aria-expanded="' + isOpen + '">' + (isOpen ? "▾" : "▸") + "</button>" +
+    '<div class="cfh"><div class="cfn" data-c="' + n + '">' + esc(g.dir.slice(i + 1)) + "/</div>" +
+    '<div class="cfp">' + k + " files" + (ways.size > 1 ? ", decided one by one" : "") +
+    (i > 0 ? " · in " + esc(g.dir.slice(0, i)) : "") + "</div></div>" +
+    seg("g" + n, 'data-g="' + n + '"', "which version of every file in " + g.dir,
+        ways.size === 1 ? [...ways][0] : null, v => {
+      const newer = g.items.filter(it => newerWay(it) === v).length;
+      return newer === k ? "newer in all " + k : newer ? "newer in " + newer + " of " + k : "";
+    }) + "</div>" + (isOpen ? g.items.map(it => conflictCard(it, true)).join("") : "") + "</div>";
 }
 
 // A card leads with the file's name; the folder it is in goes underneath.
@@ -1165,11 +1221,13 @@ function copyCard(g) {
 function decide() {
   const cs = items.filter(it => it.side === "both"), cp = review.copies || [];
   let h = "";
+  groups = group(cs);
   if (cs.length) {
     h += "<h3>" + cs.length + (cs.length === 1 ? " file" : " files") +
       " changed on both sides</h3><p>Pick the version that wins; it replaces the other when you sync. " +
-      "Left on Later, neither side is touched.</p>" +
-      cs.map(conflictCard).join("");
+      "Left on Later, neither side is touched." +
+      (groups.length < cs.length ? " A folder's switch decides every file in it." : "") + "</p>" +
+      groups.map(conflictGroup).join("");
   }
   if (cp.length) {
     h += (cs.length ? '<h3 style="margin-top:16px">' : "<h3>") +
@@ -1278,13 +1336,19 @@ listen(el("colL"));
 listen(el("colS"));
 el("decide").addEventListener("change", e => {
   const r = e.target;
-  if (r.name && r.dataset.i) {
-    const it = items[+r.dataset.i];
+  if (!r.name || !(r.dataset.i || r.dataset.g)) return;
+  for (const it of r.dataset.i ? [items[+r.dataset.i]] : groups[+r.dataset.g].items) {
     if (r.value === it.def) choice.delete(it.id); else choice.set(it.id, r.value);
-    draw();
   }
+  draw();
 });
 el("decide").addEventListener("click", async e => {
+  const t = e.target.closest("[data-c]");
+  if (t) {
+    const g = groups[+t.dataset.c];
+    open.set(g.id, t.closest(".cgh").querySelector(".tw").getAttribute("aria-expanded") !== "true");
+    return draw();
+  }
   const b = e.target.closest("[data-keep]");
   if (!b || busy) return;
   const path = b.dataset.keep, g = (review.copies || []).find(g => g.versions.some(v => v.path === path));
